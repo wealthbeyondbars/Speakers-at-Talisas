@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Gatekeeper Booth — Unified Capture</title>
+<style>
+  :root { --accent:#ffd166; --bg:#000; --fg:#fff; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  .app { position:fixed; inset:0; display:grid; grid-template-rows: 1fr auto auto; }
+  .stage { position:relative; overflow:hidden; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #overlay { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; pointer-events:none; }
+  .controls, .galleryBar { padding:10px; background:linear-gradient(180deg, rgba(0,0,0,0), rgba(0,0,0,.65)); }
+  .controls { display:flex; gap:10px; align-items:center; justify-content:center; flex-wrap:wrap; }
+  .galleryBar { display:flex; gap:10px; align-items:center; justify-content:space-between; }
+  .left, .right { display:flex; gap:10px; align-items:center; }
+  select, button, label.toggle { background:var(--accent); color:#111; border:none; border-radius:9999px; padding:10px 14px; font-weight:800; }
+  button:disabled { opacity:.6; }
+  .pill { background:rgba(255,255,255,.12); color:#fff; border-radius:9999px; padding:8px 12px; font-size:12px; }
+  .badge { position:fixed; top:10px; left:10px; background:rgba(0,0,0,.6); padding:6px 10px; border-radius:999px; font-size:12px; z-index:9; }
+  .rec-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#ff3b30; margin-right:6px; animation:pulse 1s infinite; vertical-align:middle; }
+  @keyframes pulse { 0%{opacity:.3} 50%{opacity:1} 100%{opacity:.3} }
+  .toast { position:fixed; left:50%; transform:translateX(-50%); bottom:90px; background:rgba(0,0,0,.75); color:#fff; padding:8px 12px; border-radius:8px; font-size:14px; opacity:0; transition:opacity .25s; }
+  .toast.show { opacity:1; }
+  .gallery { display:flex; gap:8px; overflow-x:auto; padding:8px 10px; background:#0b0b0b; }
+  .thumb { flex:0 0 auto; width:96px; height:160px; background:#111; border-radius:10px; overflow:hidden; position:relative; }
+  .thumb img, .thumb video { width:100%; height:100%; object-fit:cover; display:block; }
+  .thumb a.dl { position:absolute; bottom:6px; left:6px; right:6px; background:rgba(0,0,0,.6); color:#fff; text-align:center; font-size:11px; padding:4px 6px; border-radius:6px; text-decoration:none; }
+</style>
+</head>
+<body>
+  <div class="badge" id="status">Ready</div>
+  <div class="app">
+    <div class="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas"></canvas>
+      <img id="overlay" src="assets/gatekeeper_overlay.png" alt="Overlay">
+    </div>
+
+    <div class="controls">
+      <div class="left">
+        <select id="mode">
+          <option value="photo">Photo</option>
+          <option value="video">Video</option>
+        </select>
+        <label class="toggle"><input type="checkbox" id="mic" style="display:none"> Mic</label>
+        <button id="flash">Flash: On</button>
+      </div>
+      <div class="right">
+        <button id="flip">Flip Camera</button>
+        <button id="capture">Capture</button>
+        <button id="stop" disabled>Stop</button>
+      </div>
+    </div>
+
+    <div class="galleryBar">
+      <div class="pill">Captured Items (depository)</div>
+      <div class="pill" id="count">0 items</div>
+    </div>
+  </div>
+
+  <div class="gallery" id="gallery"></div>
+  <div id="toast" class="toast">Saved</div>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const overlay = document.getElementById('overlay');
+const modeSel = document.getElementById('mode');
+const micToggle = document.getElementById('mic');
+const flashBtn = document.getElementById('flash');
+const flipBtn = document.getElementById('flip');
+const captureBtn = document.getElementById('capture');
+const stopBtn = document.getElementById('stop');
+const statusBadge = document.getElementById('status');
+const toast = document.getElementById('toast');
+const gallery = document.getElementById('gallery');
+const countEl = document.getElementById('count');
+
+let usingBack = true;
+let torchOn = true;
+let stream = null;
+let recorder = null;
+let recordedChunks = [];
+let recordedBlob = null;
+let rafId = null;
+
+function showToast(msg='Saved'){
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(()=> toast.classList.remove('show'), 1200);
+}
+
+async function setTorch(on){
+  try {
+    const track = stream?.getVideoTracks?.()[0];
+    const caps = track?.getCapabilities?.();
+    if (caps && 'torch' in caps) {
+      await track.applyConstraints({ advanced: [{ torch: on }] });
+      torchOn = on;
+      flashBtn.textContent = 'Flash: ' + (on ? 'On' : 'Off');
+    } else {
+      flashBtn.disabled = true;
+      flashBtn.textContent = 'Flash: N/A';
+    }
+  } catch (e) {
+    console.warn('Torch error', e);
+    flashBtn.disabled = true;
+    flashBtn.textContent = 'Flash: N/A';
+  }
+}
+
+async function initCamera(){
+  if (stream) stream.getTracks().forEach(t=>t.stop());
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: usingBack ? 'environment' : 'user' }, advanced: [{ torch: true }] },
+      audio: false
+    });
+    video.srcObject = stream;
+    video.onloadedmetadata = () => {
+      cancelAnimationFrame(rafId);
+      drawLoop();
+      setTorch(true);
+    };
+  } catch(e){
+    alert('Camera access is required.');
+    console.error(e);
+  }
+}
+
+function drawLoop(){
+  const ctx = canvas.getContext('2d');
+  const vw = video.videoWidth || 1280;
+  const vh = video.videoHeight || 720;
+  const rect = video.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const cw = canvas.width, ch = canvas.height;
+  const vAspect = vw / vh, cAspect = cw / ch;
+  let drawW, drawH;
+  if (vAspect > cAspect){ drawH = ch; drawW = ch * vAspect; } else { drawW = cw; drawH = cw / vAspect; }
+  const dx = (cw - drawW)/2, dy = (ch - drawH)/2;
+  ctx.drawImage(video, dx, dy, drawW, drawH);
+  const ow = overlay.naturalWidth || 1080, oh = overlay.naturalHeight || 1920;
+  const oAspect = ow / oh; let oW,oH;
+  if (oAspect > cAspect){ oW = cw; oH = cw / oAspect; } else { oH = ch; oW = ch * oAspect; }
+  const odx = (cw - oW)/2, ody = (ch - oH)/2;
+  ctx.drawImage(overlay, odx, ody, oW, oH);
+  rafId = requestAnimationFrame(drawLoop);
+}
+
+function addToDepository(type, blob){
+  const url = URL.createObjectURL(blob);
+  const item = document.createElement('div');
+  item.className = 'thumb';
+  if (type === 'photo'){
+    const img = document.createElement('img');
+    img.src = url;
+    item.appendChild(img);
+    const a = document.createElement('a');
+    a.className = 'dl';
+    a.href = url;
+    a.download = 'gatekeeper_photo.png';
+    a.textContent = 'Download Photo';
+    item.appendChild(a);
+  } else {
+    const vid = document.createElement('video');
+    vid.src = url; vid.controls = true; vid.playsInline = true;
+    item.appendChild(vid);
+    const a = document.createElement('a');
+    a.className = 'dl';
+    a.href = url;
+    a.download = 'gatekeeper_video.webm';
+    a.textContent = 'Download Video';
+    item.appendChild(a);
+  }
+  gallery.prepend(item);
+  const count = gallery.querySelectorAll('.thumb').length;
+  countEl.textContent = count + (count === 1 ? ' item' : ' items');
+}
+
+async function capture(){
+  if (modeSel.value === 'photo'){
+    canvas.toBlob((b)=>{
+      addToDepository('photo', b);
+      showToast('Photo saved');
+    }, 'image/png', 1.0);
+  } else {
+    startRecording();
+  }
+}
+
+async function startRecording(){
+  const fps = 30;
+  const canvasStream = canvas.captureStream(fps);
+  if (micToggle.checked){
+    try{
+      const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      canvasStream.addTrack(audioStream.getAudioTracks()[0]);
+    }catch(e){ alert('Mic permission denied; recording without audio.'); }
+  }
+  let mime='';
+  const candidates=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+  for(const c of candidates){ if (MediaRecorder.isTypeSupported(c)) { mime = c; break; } }
+  if (!mime){ alert('MediaRecorder not supported on this browser.'); return; }
+  recordedChunks = [];
+  recorder = new MediaRecorder(canvasStream, { mimeType: mime, videoBitsPerSecond: 5_000_000 });
+  recorder.ondataavailable = (e)=>{ if (e.data && e.data.size>0) recordedChunks.push(e.data); };
+  recorder.onstop = ()=>{
+    const blob = new Blob(recordedChunks, { type: mime });
+    addToDepository('video', blob);
+    showToast('Video saved');
+    statusBadge.textContent = 'Ready';
+  };
+  recorder.start();
+  statusBadge.innerHTML = '<span class="rec-dot"></span>Recording';
+  captureBtn.disabled = true;
+  stopBtn.disabled = false;
+}
+
+function stopRecording(){
+  if (recorder && recorder.state !== 'inactive') recorder.stop();
+  captureBtn.disabled = false;
+  stopBtn.disabled = true;
+}
+
+flashBtn.onclick = ()=> setTorch(!torchOn);
+flipBtn.onclick = ()=> { usingBack = !usingBack; initCamera(); };
+captureBtn.onclick = capture;
+stopBtn.onclick = stopRecording;
+
+window.addEventListener('pageshow', initCamera);
+window.addEventListener('beforeunload', ()=>{
+  if (stream) stream.getTracks().forEach(t=>t.stop());
+  cancelAnimationFrame(rafId);
+});
+</script>
+</body>
+</html>
